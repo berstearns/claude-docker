@@ -50,8 +50,9 @@ rclone mkdir <your-remote>:<your-path>
 rclone copy ~/.claude/.credentials.json <your-remote>:<your-path>/
 rclone copy ~/.claude.json              <your-remote>:<your-path>/
 
-# Build the image
-docker build -t claude-code .
+# Build the image (does NOT need to be re-run on subsequent launches)
+./cdocker --build-only
+# ^ equivalent to:  docker build --build-arg UID=$(id -u) --build-arg GID=$(id -g) -t $CDOCKER_IMAGE .
 ```
 
 ## Usage
@@ -74,7 +75,20 @@ cdocker --remote work-drive:/team-claude/deploy
 
 # Both
 cdocker --rclone-conf ~/.config/rclone-work.conf --remote work-drive:/team/deploy
+
+# Force a rebuild before running (after Dockerfile or entrypoint changes)
+cdocker --build
+
+# Build only, don't run (CI / first-time setup)
+cdocker --build-only
 ```
+
+### Why `--build` injects UID/GID automatically
+
+`./cdocker --build` passes `--build-arg UID=$(id -u) --build-arg GID=$(id -g)` to `docker build`. The image's `claude-runner` user is created with whatever UID/GID the calling user has on that host. This means:
+
+- Files written by the container (via the `$PWD` bind-mount) end up owned by *you*, not by some random UID 1000 that may not exist on this machine.
+- The same image works correctly on hosts where your user is UID 1001, 1500, or anything else — without the wrapper's mount needing a `--user` override at runtime.
 
 ## Caveats
 

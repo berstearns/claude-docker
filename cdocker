@@ -9,8 +9,12 @@
 # Override at invocation time:
 #   --rclone-conf <path>   (or --rclone-conf=<path>)
 #   --remote      <spec>   (or --remote=<spec>)
+#   --build                build the image before running (one-time setup, or
+#                          after a Dockerfile/entrypoint change)
+#   --build-only           build the image and exit (no docker run)
 #   CDOCKER_RCLONE_CONF=<path>   (env)
 #   CDOCKER_REMOTE=<spec>        (env)
+#   CDOCKER_IMAGE=<tag>          (env, default: claude-code)
 #
 # <rclone-conf> may be a directory or a single rclone.conf file.
 set -euo pipefail
@@ -30,6 +34,9 @@ RCLONE_CONF="${CDOCKER_RCLONE_CONF:-$HOME/.config/rclone}"
 IMAGE="${CDOCKER_IMAGE:-claude-code}"
 CONTAINER_HOME="${CDOCKER_CONTAINER_HOME:-/home/claude-runner}"
 
+BUILD=0
+BUILD_ONLY=0
+
 # Parse wrapper-only flags. Stops on first unrecognized arg or `--`.
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -37,10 +44,39 @@ while [[ $# -gt 0 ]]; do
     --rclone-conf=*)      RCLONE_CONF="${1#*=}"; shift ;;
     --remote)             REMOTE="$2"; shift 2 ;;
     --remote=*)           REMOTE="${1#*=}"; shift ;;
+    --build)              BUILD=1; shift ;;
+    --build-only)         BUILD=1; BUILD_ONLY=1; shift ;;
     --)                   shift; break ;;
     *)                    break ;;
   esac
 done
+
+# Build first if requested. Auto-injects host UID/GID so the image's
+# claude-runner matches the calling user (otherwise file ownership in mounts
+# can mismatch on hosts where $UID != 1000).
+if [[ "$BUILD" -eq 1 ]]; then
+  echo "cdocker: building image '$IMAGE' from $SCRIPT_DIR ..." >&2
+  docker build \
+    --build-arg UID="$(id -u)" \
+    --build-arg GID="$(id -g)" \
+    -t "$IMAGE" \
+    "$SCRIPT_DIR"
+  if [[ "$BUILD_ONLY" -eq 1 ]]; then
+    exit 0
+  fi
+fi
+
+# Friendly error if image is missing — beats Docker's cryptic "pull access denied".
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  cat >&2 <<EOF
+cdocker: image '$IMAGE' is not built locally and is not on Docker Hub.
+  Build it once with:
+    $0 --build
+  Or manually:
+    docker build -t $IMAGE $SCRIPT_DIR
+EOF
+  exit 1
+fi
 
 if [[ -z "$REMOTE" ]]; then
   cat >&2 <<EOF
