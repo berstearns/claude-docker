@@ -1,0 +1,9 @@
+# Local config — must NEVER be committed (contains your remote name + path).
+.env
+
+# Editor / OS scratch
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/

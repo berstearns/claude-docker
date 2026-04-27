@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# cdocker — launch the Claude Code Docker image as a tmux session.
+# The container itself runs rclone to pull/push credentials. This wrapper only
+# bind-mounts your local rclone config so the container can auth to your remote.
+#
+# Configuration is loaded from `.env` next to this script (gitignored). Copy
+# `.env.template` to `.env` and edit it before first use.
+#
+# Override at invocation time:
+#   --rclone-conf <path>   (or --rclone-conf=<path>)
+#   --remote      <spec>   (or --remote=<spec>)
+#   CDOCKER_RCLONE_CONF=<path>   (env)
+#   CDOCKER_REMOTE=<spec>        (env)
+#
+# <rclone-conf> may be a directory or a single rclone.conf file.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+
+# Load .env if present (does not overwrite already-set environment).
+if [[ -f "$SCRIPT_DIR/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$SCRIPT_DIR/.env"
+  set +a
+fi
+
+REMOTE="${CDOCKER_REMOTE:-}"
+RCLONE_CONF="${CDOCKER_RCLONE_CONF:-$HOME/.config/rclone}"
+IMAGE="${CDOCKER_IMAGE:-claude-code}"
+CONTAINER_HOME="${CDOCKER_CONTAINER_HOME:-/home/claude-runner}"
+
+# Parse wrapper-only flags. Stops on first unrecognized arg or `--`.
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --rclone-conf)        RCLONE_CONF="$2"; shift 2 ;;
+    --rclone-conf=*)      RCLONE_CONF="${1#*=}"; shift ;;
+    --remote)             REMOTE="$2"; shift 2 ;;
+    --remote=*)           REMOTE="${1#*=}"; shift ;;
+    --)                   shift; break ;;
+    *)                    break ;;
+  esac
+done
+
+if [[ -z "$REMOTE" ]]; then
+  cat >&2 <<EOF
+cdocker: CDOCKER_REMOTE is unset.
+  Copy $SCRIPT_DIR/.env.template to .env and set it,
+  or pass --remote <remote>:<path> on the command line.
+EOF
+  exit 1
+fi
+
+declare -a RCLONE_OPTS=()
+if [[ -d "$RCLONE_CONF" ]]; then
+  RCLONE_OPTS+=(-v "$RCLONE_CONF:$CONTAINER_HOME/.config/rclone")
+elif [[ -f "$RCLONE_CONF" ]]; then
+  RCLONE_OPTS+=(
+    -v "$RCLONE_CONF:$CONTAINER_HOME/.config/rclone/rclone.conf"
+    -e "RCLONE_CONFIG=$CONTAINER_HOME/.config/rclone/rclone.conf"
+  )
+else
+  echo "cdocker: rclone config not found at $RCLONE_CONF" >&2
+  exit 1
+fi
+
+docker run --rm -it \
+  -e TERM="${TERM:-xterm-256color}" \
+  -e CDOCKER_REMOTE="$REMOTE" \
+  "${RCLONE_OPTS[@]}" \
+  -v "$PWD:$PWD" -w "$PWD" \
+  "$IMAGE" "$@"

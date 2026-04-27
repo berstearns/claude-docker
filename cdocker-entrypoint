@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Runs as PID 1 inside the container.
+# 1. Uses the host's rclone config (bind-mounted at ~/.config/rclone/) to pull
+#    credentials from CDOCKER_REMOTE into the ephemeral container ~/.claude/.
+# 2. Builds the named tmux session.
+# 3. Attaches in the foreground (NOT exec'd) so the EXIT trap can fire after
+#    the user detaches/exits, pushing rotated tokens back to the remote.
+set -euo pipefail
+
+REMOTE="${CDOCKER_REMOTE:-}"
+SESSION="claude"
+
+if [[ -z "$REMOTE" ]]; then
+  echo "cdocker-entrypoint: CDOCKER_REMOTE not set — wrapper should pass it via -e" >&2
+  exit 1
+fi
+
+# --- pull credentials from rclone remote --------------------------------------
+mkdir -p "$HOME/.claude"
+if ! rclone copy --quiet "$REMOTE/.credentials.json" "$HOME/.claude/"; then
+  echo "cdocker-entrypoint: rclone failed to pull $REMOTE/.credentials.json" >&2
+  echo "  is ~/.config/rclone/ bind-mounted? does the remote exist?"        >&2
+  exit 1
+fi
+rclone copy --quiet "$REMOTE/.claude.json" "$HOME/" || true
+[[ -s "$HOME/.claude/.credentials.json" ]] \
+  || { echo "pulled .credentials.json is empty" >&2; exit 1; }
+chmod 600 "$HOME/.claude/.credentials.json"
+
+# --- push refreshed credentials back on exit (success / error / detach) ------
+push_back() {
+  rclone copy --quiet "$HOME/.claude/.credentials.json" "$REMOTE/" 2>/dev/null || true
+  rclone copy --quiet "$HOME/.claude.json"              "$REMOTE/" 2>/dev/null || true
+}
+trap push_back EXIT
+
+# --- build tmux session -------------------------------------------------------
+START_DIR="${PWD:-$HOME}"
+[[ -d "$START_DIR" ]] || START_DIR="$HOME"
+
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+  tmux attach -t "$SESSION"
+  exit 0
+fi
+
+# Window 1: agent — single pane running Claude Code with permissions skipped.
+tmux new-session -d -s "$SESSION" -n agent -c "$START_DIR"
+tmux select-pane  -t "$SESSION:agent" -T "claude · $(basename "$START_DIR")"
+tmux send-keys    -t "$SESSION:agent" 'claude --dangerously-skip-permissions' C-m
+
+# Window 2: shell — bash for git, rg, etc.
+tmux new-window  -t "$SESSION" -n shell -c "$START_DIR"
+tmux select-pane -t "$SESSION:shell" -T "shell · $(basename "$START_DIR")"
+
+# Window 3: logs — tail Claude's history JSONL.
+tmux new-window  -t "$SESSION" -n logs  -c "$HOME/.claude"
+tmux select-pane -t "$SESSION:logs"  -T "history.jsonl"
+tmux send-keys   -t "$SESSION:logs"  'tail -F history.jsonl 2>/dev/null || echo "(no history yet)"' C-m
+
+tmux select-window -t "$SESSION:agent"
+
+# IMPORTANT: no `exec` here — when tmux attach returns (user detaches/exits),
+# this script continues to its natural end and the EXIT trap fires push_back.
+tmux attach -t "$SESSION"
