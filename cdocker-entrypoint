@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
 # Runs as PID 1 inside the container.
-# 1. Uses the host's rclone config (bind-mounted at ~/.config/rclone/) to pull
-#    credentials from CDOCKER_REMOTE into the ephemeral container ~/.claude/.
-# 2. Builds the named tmux session.
-# 3. Attaches in the foreground (NOT exec'd) so the EXIT trap can fire after
-#    the user detaches/exits, pushing rotated tokens back to the remote.
+#   - rclone-pulls credentials from CDOCKER_REMOTE into the ephemeral ~/.claude/
+#   - on EXIT, pushes rotated tokens back to the remote
+#   - if CDOCKER_VERIFY=1, runs a non-interactive auth probe instead of tmux
+#   - otherwise builds and attaches the named tmux session
 set -euo pipefail
 
 REMOTE="${CDOCKER_REMOTE:-}"
 SESSION="claude"
+VERIFY="${CDOCKER_VERIFY:-0}"
 
 if [[ -z "$REMOTE" ]]; then
   echo "cdocker-entrypoint: CDOCKER_REMOTE not set — wrapper should pass it via -e" >&2
   exit 1
 fi
 
-# --- pull credentials from rclone remote --------------------------------------
+# --- pull credentials --------------------------------------------------------
 mkdir -p "$HOME/.claude"
 if ! rclone copy --quiet "$REMOTE/.credentials.json" "$HOME/.claude/"; then
   echo "cdocker-entrypoint: rclone failed to pull $REMOTE/.credentials.json" >&2
@@ -27,14 +27,43 @@ rclone copy --quiet "$REMOTE/.claude.json" "$HOME/" || true
   || { echo "pulled .credentials.json is empty" >&2; exit 1; }
 chmod 600 "$HOME/.claude/.credentials.json"
 
-# --- push refreshed credentials back on exit (success / error / detach) ------
+# --- push refreshed credentials back on exit ---------------------------------
 push_back() {
   rclone copy --quiet "$HOME/.claude/.credentials.json" "$REMOTE/" 2>/dev/null || true
   rclone copy --quiet "$HOME/.claude.json"              "$REMOTE/" 2>/dev/null || true
 }
 trap push_back EXIT
 
-# --- build tmux session -------------------------------------------------------
+# --- verify mode: non-interactive auth probe, no tmux ------------------------
+if [[ "$VERIFY" == "1" ]]; then
+  echo "--- claude --version ---"
+  claude --version
+  echo
+  echo "--- claude -p 'respond with: PONG' (this hits the API) ---"
+  if timeout 60 claude -p "respond with exactly the word: PONG"; then
+    echo
+    echo "cdocker-entrypoint: VERIFY OK"
+    exit 0
+  else
+    rc=$?
+    cat >&2 <<EOF
+
+cdocker-entrypoint: VERIFY FAILED (exit $rc)
+
+Most likely the credentials in $REMOTE are stale. Refresh them from a host
+that has a working 'claude' login, then retry on this host:
+
+  # on the authenticated host:
+  ~/projects/claude-docker/cdocker-push
+
+  # then back here:
+  cdocker --verify
+EOF
+    exit "$rc"
+  fi
+fi
+
+# --- normal path: build tmux session -----------------------------------------
 START_DIR="${PWD:-$HOME}"
 [[ -d "$START_DIR" ]] || START_DIR="$HOME"
 

@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# cdocker-push — upload this host's live Claude Code credentials to the rclone
+# remote. Run on a host where 'claude' is authenticated; subsequent 'cdocker'
+# launches on any other host (including ones you don't control) will pull
+# these fresh tokens.
+#
+# Re-run cdocker-push whenever:
+#   - the unknown-host container fails to authenticate (refresh tokens are
+#     rotated server-side; only the host that did the most recent claude API
+#     call holds the live one)
+#   - you've re-authenticated 'claude' on this host
+#   - you've changed accounts on this host
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+
+if [[ -f "$SCRIPT_DIR/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$SCRIPT_DIR/.env"
+  set +a
+fi
+
+REMOTE="${CDOCKER_REMOTE:-}"
+RCLONE_CONF="${CDOCKER_RCLONE_CONF:-$HOME/.config/rclone}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --remote)        REMOTE="$2"; shift 2 ;;
+    --remote=*)      REMOTE="${1#*=}"; shift ;;
+    --rclone-conf)   RCLONE_CONF="$2"; shift 2 ;;
+    --rclone-conf=*) RCLONE_CONF="${1#*=}"; shift ;;
+    -h|--help)       awk '/^#!/{next} /^[^#]/{exit} {print}' "$0"; exit 0 ;;
+    *)               echo "cdocker-push: unknown flag: $1" >&2; exit 1 ;;
+  esac
+done
+
+if [[ -z "$REMOTE" ]]; then
+  cat >&2 <<EOF
+cdocker-push: CDOCKER_REMOTE is unset.
+  Copy $SCRIPT_DIR/.env.template to .env and set it,
+  or pass --remote <remote>:<path>.
+EOF
+  exit 1
+fi
+
+if [[ ! -f "$HOME/.claude/.credentials.json" ]]; then
+  cat >&2 <<EOF
+cdocker-push: $HOME/.claude/.credentials.json not found.
+  This host must be authenticated with 'claude' before push has anything to
+  upload. Run 'claude' once on this host to log in, then retry.
+EOF
+  exit 1
+fi
+
+declare -a CFG=()
+if [[ -f "$RCLONE_CONF" ]]; then
+  CFG+=(--config "$RCLONE_CONF")
+elif [[ -d "$RCLONE_CONF" && -f "$RCLONE_CONF/rclone.conf" ]]; then
+  CFG+=(--config "$RCLONE_CONF/rclone.conf")
+else
+  echo "cdocker-push: rclone config not found at $RCLONE_CONF" >&2
+  exit 1
+fi
+
+echo "cdocker-push: uploading credentials from $HOME/.claude/ to $REMOTE"
+rclone "${CFG[@]}" copy "$HOME/.claude/.credentials.json" "$REMOTE/"
+[[ -f "$HOME/.claude.json" ]] \
+  && rclone "${CFG[@]}" copy "$HOME/.claude.json" "$REMOTE/"
+
+echo
+echo "cdocker-push: contents of $REMOTE now:"
+rclone "${CFG[@]}" lsl "$REMOTE/"
+echo
+echo "cdocker-push: done — fresh tokens are on the remote."
+echo "  next 'cdocker' launch (on any host) will pull these."

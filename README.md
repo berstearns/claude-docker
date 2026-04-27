@@ -45,10 +45,9 @@ cd ~/projects/claude-docker
 cp .env.template .env
 $EDITOR .env                       # set CDOCKER_REMOTE at minimum
 
-# One-time: seed the remote with your current Claude Code credentials
-rclone mkdir <your-remote>:<your-path>
-rclone copy ~/.claude/.credentials.json <your-remote>:<your-path>/
-rclone copy ~/.claude.json              <your-remote>:<your-path>/
+# Seed the remote with your live credentials (run on the host where 'claude'
+# is logged in). cdocker-push handles the rclone mkdir + uploads.
+./cdocker-push
 
 # Build the image (does NOT need to be re-run on subsequent launches)
 ./cdocker --build-only
@@ -90,6 +89,30 @@ cdocker --build-only
 - Files written by the container (via the `$PWD` bind-mount) end up owned by *you*, not by some random UID 1000 that may not exist on this machine.
 - The same image works correctly on hosts where your user is UID 1001, 1500, or anything else — without the wrapper's mount needing a `--user` override at runtime.
 
+## Unknown-host workflow (the design point)
+
+The default mode is built for "I want to run Claude on a host I don't control" — a borrowed laptop, a CI runner, a friend's machine. The remote host needs only Docker plus an rclone config that can read/write the credential remote. It does **not** need Claude Code installed or pre-authenticated.
+
+Anthropic rotates refresh tokens server-side on every successful refresh, so the *only* host with a valid refresh token at any moment is the host whose container last ran. If you run on host A, then on host B without first refreshing, B starts with the token A already invalidated. The fix is the two-step push-then-pull:
+
+```bash
+#  step 1 — on a host you trust, where 'claude' is authenticated:
+~/projects/claude-docker/cdocker-push
+
+#  step 2 — on the unknown host:
+~/projects/claude-docker/cdocker
+```
+
+`cdocker-push` uploads this host's live `~/.claude/.credentials.json` and `~/.claude.json` to the remote. The next `cdocker` launch on any host pulls those tokens. Re-run `cdocker-push` whenever a remote-host launch fails to authenticate, or whenever you re-auth `claude` on the trusted host.
+
+### Verifying auth without committing to tmux
+
+```bash
+cdocker --verify
+```
+
+Skips tmux and runs `claude -p "respond with: PONG"` non-interactively against the pulled credentials. Exits 0 on success, non-zero with a hint to run `cdocker-push` if auth fails. Use this on the unknown host as the first sanity check after `cdocker-push` finishes on the trusted host.
+
 ## Caveats
 
 - **Don't run on two machines simultaneously.** rclone has no atomic compare-and-swap; the last machine to push wins on token rotation. Refresh tokens are long-lived enough that you usually won't get hard-bounced to OAuth, but you can lose an access-token rotation.
@@ -103,6 +126,7 @@ cdocker --build-only
 |---|---|
 | `Dockerfile` | Image recipe (node:22-slim base, claude-runner user, COPY of entrypoint + tmux.conf) |
 | `cdocker` | Host-side launcher: parses flags/env, mounts rclone config, runs the image |
+| `cdocker-push` | Host-side credential refresher: uploads this host's live `~/.claude/` to the rclone remote (run on a trusted host before launching cdocker on an unknown one) |
 | `cdocker-entrypoint` | In-container PID 1: rclone-pulls creds, builds tmux session, traps EXIT to push back |
 | `tmux.conf` | tmux options — pane border on top so titled panes render |
 | `.env.template` | Variables the wrapper reads — copy to `.env` (gitignored) |

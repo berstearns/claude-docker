@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # cdocker — launch the Claude Code Docker image as a tmux session.
-# The container itself runs rclone to pull/push credentials. This wrapper only
-# bind-mounts your local rclone config so the container can auth to your remote.
+#
+# Designed for "totally unknown host" use: rclone carries the credentials,
+# the host needs no claude install. Container pulls credentials from
+# CDOCKER_REMOTE at startup; pushes rotated tokens back on clean exit.
+#
+# To refresh the remote with fresh tokens (run on a host that IS authenticated
+# with claude), use the sibling script `cdocker-push`.
 #
 # Configuration is loaded from `.env` next to this script (gitignored). Copy
 # `.env.template` to `.env` and edit it before first use.
@@ -9,6 +14,8 @@
 # Override at invocation time:
 #   --rclone-conf <path>   (or --rclone-conf=<path>)
 #   --remote      <spec>   (or --remote=<spec>)
+#   --verify               run a non-interactive auth check, no tmux. Exits 0
+#                          if Claude responded; non-zero if auth failed.
 #   --build                build the image before running (one-time setup, or
 #                          after a Dockerfile/entrypoint change)
 #   --build-only           build the image and exit (no docker run)
@@ -21,7 +28,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 
-# Load .env if present (does not overwrite already-set environment).
 if [[ -f "$SCRIPT_DIR/.env" ]]; then
   set -a
   # shellcheck disable=SC1091
@@ -36,14 +42,15 @@ CONTAINER_HOME="${CDOCKER_CONTAINER_HOME:-/home/claude-runner}"
 
 BUILD=0
 BUILD_ONLY=0
+VERIFY=0
 
-# Parse wrapper-only flags. Stops on first unrecognized arg or `--`.
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --rclone-conf)        RCLONE_CONF="$2"; shift 2 ;;
     --rclone-conf=*)      RCLONE_CONF="${1#*=}"; shift ;;
     --remote)             REMOTE="$2"; shift 2 ;;
     --remote=*)           REMOTE="${1#*=}"; shift ;;
+    --verify)             VERIFY=1; shift ;;
     --build)              BUILD=1; shift ;;
     --build-only)         BUILD=1; BUILD_ONLY=1; shift ;;
     --)                   shift; break ;;
@@ -51,9 +58,6 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Build first if requested. Auto-injects host UID/GID so the image's
-# claude-runner matches the calling user (otherwise file ownership in mounts
-# can mismatch on hosts where $UID != 1000).
 if [[ "$BUILD" -eq 1 ]]; then
   echo "cdocker: building image '$IMAGE' from $SCRIPT_DIR ..." >&2
   docker build \
@@ -61,12 +65,9 @@ if [[ "$BUILD" -eq 1 ]]; then
     --build-arg GID="$(id -g)" \
     -t "$IMAGE" \
     "$SCRIPT_DIR"
-  if [[ "$BUILD_ONLY" -eq 1 ]]; then
-    exit 0
-  fi
+  [[ "$BUILD_ONLY" -eq 1 ]] && exit 0
 fi
 
-# Friendly error if image is missing — beats Docker's cryptic "pull access denied".
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
   cat >&2 <<EOF
 cdocker: image '$IMAGE' is not built locally and is not on Docker Hub.
@@ -87,11 +88,11 @@ EOF
   exit 1
 fi
 
-declare -a RCLONE_OPTS=()
+declare -a MOUNT_OPTS=()
 if [[ -d "$RCLONE_CONF" ]]; then
-  RCLONE_OPTS+=(-v "$RCLONE_CONF:$CONTAINER_HOME/.config/rclone")
+  MOUNT_OPTS+=(-v "$RCLONE_CONF:$CONTAINER_HOME/.config/rclone")
 elif [[ -f "$RCLONE_CONF" ]]; then
-  RCLONE_OPTS+=(
+  MOUNT_OPTS+=(
     -v "$RCLONE_CONF:$CONTAINER_HOME/.config/rclone/rclone.conf"
     -e "RCLONE_CONFIG=$CONTAINER_HOME/.config/rclone/rclone.conf"
   )
@@ -100,9 +101,17 @@ else
   exit 1
 fi
 
-docker run --rm -it \
+declare -a TTY_OPTS=(-it)
+declare -a RUN_OPTS=()
+if [[ "$VERIFY" -eq 1 ]]; then
+  TTY_OPTS=()
+  RUN_OPTS+=(-e "CDOCKER_VERIFY=1")
+fi
+
+docker run --rm "${TTY_OPTS[@]}" \
   -e TERM="${TERM:-xterm-256color}" \
   -e CDOCKER_REMOTE="$REMOTE" \
-  "${RCLONE_OPTS[@]}" \
+  "${RUN_OPTS[@]}" \
+  "${MOUNT_OPTS[@]}" \
   -v "$PWD:$PWD" -w "$PWD" \
   "$IMAGE" "$@"
